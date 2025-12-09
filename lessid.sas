@@ -27,6 +27,7 @@ proc print data=original_data (obs=10);
     title 'Sample Input Data';
 run;
 
+/* hash of id columns */
 /* Using PROC SQL to get column select components */
 proc sql;
     create table select_components as
@@ -35,22 +36,17 @@ proc sql;
         CASE
             WHEN lower(name) in (&id_columns) THEN
                 'CASE WHEN ' || name || ' IS NOT NULL THEN ' ||
-                    'SHA256HEX(' || name || " || '&salt') " || 
+                    'SHA256HEX(TRIM(' || name || ") || '&salt') " || 
                 "ELSE " || name || " END AS " || name || ' LENGTH=64'
-            /* Date-shifting logic for columns ending in "date" */
-            WHEN lower(name) like '%_date' then
-                'CASE WHEN ' || name || ' IS NOT NULL THEN ' ||
-                "intnx('day'," || name || ", floor(rand('uniform')*" || strip(put(&date_shift_days * 2 + 1, best.)) || ")-" || strip(put(&date_shift_days, best.)) || ")" ||
-                'ELSE ' || name || ' END AS ' || name
             ELSE name
         END as select_component
     from dictionary.columns
     where libname = 'WORK' and memname = 'ORIGINAL_DATA';
 quit;
 
-proc print data=select_components;
-    title 'Column select components';
-run;
+/* proc print data=select_components; */
+/*     title 'Column select components'; */
+/* run; */
 
 /* Create macro variable with all select components */
 proc sql noprint;
@@ -61,11 +57,21 @@ quit;
 /* Display the generated select list */
 %put Generated SELECT list: &select_list;
 
-/* Build and execute the final SQL query */
+/* Build and execute the final SQL query for id hashing*/
 proc sql;
-    create table hashed_data (compress=yes) as
+    create table hashed_data as
     select &select_list
     from original_data;
+quit;
+
+/* date shifting */
+/* check if patid exists */
+proc sql noprint;
+    select count(*) into :patid_exists
+    from dictionary.columns
+    where libname='WORK'
+          and memname='HASHED_DATA'
+          and lowcase(name)='patid';
 quit;
 
 /* Identify all numeric date columns in hashed_data */
@@ -81,8 +87,35 @@ quit;
 
 %let date_count = &sqlobs; 
 
-/* Apply DATE9. format to these columns only if any exist */
 %if &date_count > 0 %then %do;
+    %put Date columns to be shifted: &date_cols;
+    DATA hashed_data;
+        set hashed_data;
+
+        /* Calculate day_shift once per row */
+        if &patid_exists > 0 then do;
+            length patid_salted_hash $64;
+            patid_salted_hash = SHA256HEX(trim(patid) || "&salt");
+            day_shift = mod(input(substr(patid_salted_hash, 1, 8), hex8.), &date_shift_days * 2 + 1) - &date_shift_days;
+            drop patid_salted_hash;
+        end;
+        else day_shift = mod(input(substr(SHA256HEX("&salt"), 1, 8), hex8.), &date_shift_days * 2 + 1) - &date_shift_days;
+
+        /* Shift all date columns using the same day_shift */
+        array date_vars {*} &date_cols;
+        do i = 1 to dim(date_vars);
+            /* Shift non-missing date values in all identified date columns */
+            if not missing(date_vars{i}) then do;
+                date_vars{i} = intnx('day', date_vars{i}, day_shift);
+                date_vars{i} = min(max(date_vars{i}, '01JAN1900'd), '31DEC9999'd); /* ensure date within valid range */
+            end;
+        end;
+
+        drop day_shift;
+        drop i;
+    run;
+
+    /* Apply DATE9. format to these columns only if any exist */
     proc datasets lib=work nolist;
         modify hashed_data;
         format &date_cols YYMMDD10.;
